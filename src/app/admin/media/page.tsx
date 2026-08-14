@@ -1,9 +1,10 @@
 'use client';
 
-import { useState } from 'react';
+import { ChangeEvent, FormEvent, useEffect, useState } from 'react';
 import Image from 'next/image';
-import { Upload, Copy, Check, Trash2, Image as ImageIcon, Info } from 'lucide-react';
+import { Upload, Copy, Check, Trash2, Info, Image as ImageIcon } from 'lucide-react';
 import { sampleImages } from '@/config/sampleImages';
+import { supabase, isSupabaseConfigured } from '@/lib/supabase';
 
 interface MediaAsset {
   id: string;
@@ -14,6 +15,10 @@ interface MediaAsset {
   size: string;
   alt: string;
 }
+
+const MEDIA_STORAGE_KEY = 'lp_media_library_v2';
+const SUPABASE_BUCKET = 'media';
+const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
 
 const initialMedia: MediaAsset[] = [
   {
@@ -95,25 +100,187 @@ export default function AdminMediaPage() {
   const [uploadUrl, setUploadUrl] = useState('');
   const [uploadName, setUploadName] = useState('');
   const [uploadCategory, setUploadCategory] = useState('Graduation');
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [previewUrl, setPreviewUrl] = useState('');
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [isUploading, setIsUploading] = useState(false);
+  const [message, setMessage] = useState('');
+  const [error, setError] = useState('');
 
-  const handleAddMedia = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!uploadUrl) return;
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(MEDIA_STORAGE_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved) as MediaAsset[];
+        if (Array.isArray(parsed)) setMediaList(parsed);
+      }
+    } catch {
+      // Keep the built-in sample library if local storage is unavailable.
+    }
+  }, []);
 
-    const newAsset: MediaAsset = {
-      id: `med-${Date.now()}`,
-      name: uploadName || 'Uploaded Asset',
-      url: uploadUrl,
-      category: uploadCategory,
-      dimensions: '1920 × 1280 px',
-      size: '1.2 MB',
-      alt: uploadName || 'Portfolio media asset'
+  useEffect(() => {
+    try {
+      localStorage.setItem(MEDIA_STORAGE_KEY, JSON.stringify(mediaList));
+    } catch {
+      // Do not block the UI if browser storage is unavailable.
+    }
+  }, [mediaList]);
+
+  useEffect(() => {
+    return () => {
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
     };
+  }, [previewUrl]);
 
-    setMediaList([newAsset, ...mediaList]);
-    setUploadUrl('');
-    setUploadName('');
+  const handleFileChange = (e: ChangeEvent<HTMLInputElement>) => {
+    setError('');
+    setMessage('');
+
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) {
+      setError('Please select a JPG, PNG, or WEBP image.');
+      e.target.value = '';
+      return;
+    }
+
+    if (file.size > MAX_FILE_SIZE) {
+      setError('Image is too large. Maximum allowed size is 10 MB.');
+      e.target.value = '';
+      return;
+    }
+
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+
+    setSelectedFile(file);
+    setPreviewUrl(URL.createObjectURL(file));
+
+    if (!uploadName) {
+      setUploadName(file.name.replace(/\.[^/.]+$/, ''));
+    }
+  };
+
+  const getImageDimensions = (file: File): Promise<{ width: number; height: number }> =>
+    new Promise((resolve, reject) => {
+      const image = new window.Image();
+      const objectUrl = URL.createObjectURL(file);
+
+      image.onload = () => {
+        URL.revokeObjectURL(objectUrl);
+        resolve({ width: image.naturalWidth, height: image.naturalHeight });
+      };
+
+      image.onerror = () => {
+        URL.revokeObjectURL(objectUrl);
+        reject(new Error('Unable to read image dimensions.'));
+      };
+
+      image.src = objectUrl;
+    });
+
+  const formatBytes = (bytes: number) => {
+    if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  };
+
+  const handleAddMedia = async (e: FormEvent) => {
+    e.preventDefault();
+    setError('');
+    setMessage('');
+
+    // Existing URL workflow remains available.
+    if (!selectedFile && uploadUrl.trim()) {
+      const newAsset: MediaAsset = {
+        id: `med-${Date.now()}`,
+        name: uploadName || 'Uploaded Asset',
+        url: uploadUrl.trim(),
+        category: uploadCategory,
+        dimensions: '1920 × 1280 px',
+        size: 'External URL',
+        alt: uploadName || 'Portfolio media asset'
+      };
+
+      setMediaList((current) => [newAsset, ...current]);
+      setUploadUrl('');
+      setUploadName('');
+      setMessage('Image URL added to the Media Library.');
+      return;
+    }
+
+    if (!selectedFile) {
+      setError('Choose an image from your computer or enter an image URL.');
+      return;
+    }
+
+    if (!isSupabaseConfigured || !supabase) {
+      setError(
+        'Supabase is not configured. Add NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY to .env.local / Vercel before uploading local files.'
+      );
+      return;
+    }
+
+    setIsUploading(true);
+
+    try {
+      const extension = selectedFile.name.split('.').pop()?.toLowerCase() || 'jpg';
+      const safeName =
+        (uploadName || selectedFile.name.replace(/\.[^/.]+$/, ''))
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, '-')
+          .replace(/^-+|-+$/g, '') || 'image';
+
+      const filePath = `portfolio/${Date.now()}-${safeName}.${extension}`;
+
+      const { error: uploadError } = await supabase.storage
+        .from(SUPABASE_BUCKET)
+        .upload(filePath, selectedFile, {
+          cacheControl: '3600',
+          upsert: false,
+          contentType: selectedFile.type
+        });
+
+      if (uploadError) {
+        throw uploadError;
+      }
+
+      const { data: publicUrlData } = supabase.storage
+        .from(SUPABASE_BUCKET)
+        .getPublicUrl(filePath);
+
+      if (!publicUrlData?.publicUrl) {
+        throw new Error('Supabase did not return a public image URL.');
+      }
+
+      const dimensions = await getImageDimensions(selectedFile);
+
+      const newAsset: MediaAsset = {
+        id: `med-${Date.now()}`,
+        name: uploadName || selectedFile.name,
+        url: publicUrlData.publicUrl,
+        category: uploadCategory,
+        dimensions: `${dimensions.width} × ${dimensions.height} px`,
+        size: formatBytes(selectedFile.size),
+        alt: uploadName || 'Portfolio media asset'
+      };
+
+      setMediaList((current) => [newAsset, ...current]);
+      setSelectedFile(null);
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
+      setPreviewUrl('');
+      setUploadName('');
+      setMessage('Image uploaded to Supabase Storage and added to the Media Library.');
+    } catch (uploadError) {
+      console.error('Media upload failed:', uploadError);
+      setError(
+        uploadError instanceof Error
+          ? uploadError.message
+          : 'Image upload failed. Check your Supabase Storage bucket and permissions.'
+      );
+    } finally {
+      setIsUploading(false);
+    }
   };
 
   const handleCopy = (id: string, url: string) => {
@@ -123,21 +290,21 @@ export default function AdminMediaPage() {
   };
 
   const handleDelete = (id: string) => {
-    setMediaList(mediaList.filter(m => m.id !== id));
+    setMediaList((current) => current.filter((m) => m.id !== id));
   };
 
   return (
     <div className="space-y-8 max-w-6xl">
-      {/* Header */}
       <div className="pb-6 border-b border-slate-200">
-        <span className="text-xs font-mono uppercase tracking-wider text-blue-600 font-semibold">STORAGE & ASSETS</span>
+        <span className="text-xs font-mono uppercase tracking-wider text-blue-600 font-semibold">
+          STORAGE & ASSETS
+        </span>
         <h1 className="text-2xl font-bold text-slate-900 tracking-tight">Media Library</h1>
         <p className="text-xs text-slate-500 mt-0.5">
           Manage original high-resolution photographs, brand assets, and Supabase Storage uploads (Requirement 36 & 58)
         </p>
       </div>
 
-      {/* Supabase Storage Pipeline Info Box */}
       <div className="p-4 bg-blue-50/70 border border-blue-200 rounded-lg flex items-start gap-3 text-xs">
         <Info className="w-4 h-4 text-blue-600 shrink-0 mt-0.5" />
         <div className="space-y-0.5 text-slate-700">
@@ -148,59 +315,144 @@ export default function AdminMediaPage() {
         </div>
       </div>
 
-      {/* Upload Box */}
       <div className="bg-white border border-slate-200 rounded-lg p-6 shadow-xs">
         <h2 className="text-xs font-mono uppercase tracking-wider text-blue-600 font-semibold mb-4">
           Upload / Register New Asset
         </h2>
-        <form onSubmit={handleAddMedia} className="grid grid-cols-1 sm:grid-cols-12 gap-4 items-end">
-          <div className="sm:col-span-5">
-            <label className="block text-xs font-semibold text-slate-700 mb-1">Image URL (Unsplash or Supabase Storage URL)</label>
-            <input
-              type="text"
-              placeholder="https://images.unsplash.com/..."
-              value={uploadUrl}
-              onChange={(e) => setUploadUrl(e.target.value)}
-              required
-              className="w-full bg-slate-50 border border-slate-300 focus:bg-white focus:border-blue-600 rounded-md px-3 py-2 text-xs text-slate-900 outline-none"
-            />
+
+        <form onSubmit={handleAddMedia} className="space-y-5">
+          <div className="grid grid-cols-1 sm:grid-cols-12 gap-4 items-end">
+            <div className="sm:col-span-5">
+              <label className="block text-xs font-semibold text-slate-700 mb-1">
+                Image URL (existing option)
+              </label>
+              <input
+                type="text"
+                placeholder="https://images.unsplash.com/..."
+                value={uploadUrl}
+                onChange={(e) => {
+                  setUploadUrl(e.target.value);
+                  if (e.target.value) setSelectedFile(null);
+                }}
+                className="w-full bg-slate-50 border border-slate-300 focus:bg-white focus:border-blue-600 rounded-md px-3 py-2 text-xs text-slate-900 outline-none"
+              />
+            </div>
+
+            <div className="sm:col-span-4">
+              <label className="block text-xs font-semibold text-slate-700 mb-1">
+                Asset Label / Title
+              </label>
+              <input
+                type="text"
+                placeholder="e.g. Jaffna Convocation Shot #1"
+                value={uploadName}
+                onChange={(e) => setUploadName(e.target.value)}
+                className="w-full bg-slate-50 border border-slate-300 focus:bg-white focus:border-blue-600 rounded-md px-3 py-2 text-xs text-slate-900 outline-none"
+              />
+            </div>
+
+            <div className="sm:col-span-3">
+              <label className="block text-xs font-semibold text-slate-700 mb-1">
+                Category
+              </label>
+              <select
+                value={uploadCategory}
+                onChange={(e) => setUploadCategory(e.target.value)}
+                className="w-full bg-slate-50 border border-slate-300 focus:bg-white focus:border-blue-600 rounded-md px-3 py-2 text-xs text-slate-900 outline-none"
+              >
+                <option>Graduation</option>
+                <option>Events</option>
+                <option>Portrait</option>
+                <option>Kovil Events</option>
+                <option>Sports</option>
+                <option>Design / Logo</option>
+                <option>Design / Poster</option>
+                <option>Other</option>
+              </select>
+            </div>
           </div>
 
-          <div className="sm:col-span-4">
-            <label className="block text-xs font-semibold text-slate-700 mb-1">Asset Label / Title</label>
-            <input
-              type="text"
-              placeholder="e.g. Jaffna Convocation Shot #1"
-              value={uploadName}
-              onChange={(e) => setUploadName(e.target.value)}
-              className="w-full bg-slate-50 border border-slate-300 focus:bg-white focus:border-blue-600 rounded-md px-3 py-2 text-xs text-slate-900 outline-none"
-            />
+          <div className="border-t border-slate-100 pt-5">
+            <label className="block text-xs font-semibold text-slate-700 mb-2">
+              Upload from your computer
+            </label>
+
+            <div className="flex flex-col sm:flex-row gap-4 items-start">
+              <label className="inline-flex items-center gap-2 px-4 py-2.5 bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold rounded-md cursor-pointer transition-colors">
+                <ImageIcon className="w-4 h-4" />
+                <span>{selectedFile ? 'Choose another image' : 'Choose Image'}</span>
+                <input
+                  type="file"
+                  accept="image/jpeg,image/png,image/webp"
+                  onChange={handleFileChange}
+                  className="hidden"
+                />
+              </label>
+
+              {selectedFile && (
+                <div className="text-xs text-slate-600">
+                  <p className="font-semibold text-slate-900">{selectedFile.name}</p>
+                  <p>{formatBytes(selectedFile.size)} · {selectedFile.type}</p>
+                </div>
+              )}
+            </div>
+
+            {previewUrl && (
+              <div className="mt-4 flex gap-4 items-center">
+                <div className="relative w-28 h-20 rounded-md overflow-hidden bg-slate-100 border border-slate-200">
+                  <Image src={previewUrl} alt="Selected image preview" fill sizes="112px" className="object-cover" unoptimized />
+                </div>
+                <p className="text-xs text-slate-500">
+                  Preview only. The original image will be uploaded to Supabase Storage.
+                </p>
+              </div>
+            )}
           </div>
 
-          <div className="sm:col-span-3">
+          {(message || error) && (
+            <div
+              className={`text-xs rounded-md px-3 py-2 ${error
+                  ? 'bg-red-50 border border-red-200 text-red-700'
+                  : 'bg-emerald-50 border border-emerald-200 text-emerald-700'
+                }`}
+            >
+              {error || message}
+            </div>
+          )}
+
+          <div className="flex justify-end">
             <button
               type="submit"
-              className="w-full py-2 bg-blue-600 hover:bg-blue-700 text-white font-semibold text-xs uppercase tracking-wider rounded-md flex items-center justify-center gap-2 transition-colors shadow-xs"
+              disabled={isUploading}
+              className="py-2.5 px-5 bg-blue-600 hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed text-white font-semibold text-xs uppercase tracking-wider rounded-md flex items-center justify-center gap-2 transition-colors shadow-xs"
             >
               <Upload className="w-3.5 h-3.5" />
-              <span>Add to Library</span>
+              <span>{isUploading ? 'Uploading...' : 'Add to Library'}</span>
             </button>
           </div>
         </form>
       </div>
 
-      {/* Media Grid */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
         {mediaList.map((asset) => (
-          <div key={asset.id} className="group bg-white border border-slate-200 rounded-lg overflow-hidden flex flex-col justify-between shadow-xs hover:shadow-md transition-shadow">
+          <div
+            key={asset.id}
+            className="group bg-white border border-slate-200 rounded-lg overflow-hidden flex flex-col justify-between shadow-xs hover:shadow-md transition-shadow"
+          >
             <div>
               <div className="relative aspect-[4/3] bg-slate-100 overflow-hidden">
-                <Image src={asset.url} alt={asset.alt} fill sizes="300px" className="object-cover" />
+                <Image
+                  src={asset.url}
+                  alt={asset.alt}
+                  fill
+                  sizes="300px"
+                  className="object-cover"
+                  unoptimized={asset.url.startsWith('blob:')}
+                />
                 <span className="absolute top-2 left-2 bg-white/95 px-2 py-0.5 rounded text-[10px] font-mono font-semibold text-slate-800 shadow-xs">
                   {asset.category}
                 </span>
               </div>
-
               <div className="p-3.5 space-y-1">
                 <h3 className="text-xs font-bold text-slate-900 truncate">{asset.name}</h3>
                 <div className="flex items-center justify-between text-[11px] text-slate-500 font-mono">
